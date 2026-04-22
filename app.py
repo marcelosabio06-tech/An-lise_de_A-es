@@ -14,8 +14,18 @@ from ta.trend import MACD, EMAIndicator
 from ta.volatility import BollingerBands
 from io import BytesIO
 import warnings
+import sys
 
-warnings.filterwarnings("ignore")
+# Suprime warnings que poluem o log
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Garante encoding UTF-8 para evitar erros de caracteres
+if sys.stdout.encoding != 'UTF-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except:
+        pass
 
 # =============================================================================
 # CONFIGURAÇÃO DA PÁGINA
@@ -31,30 +41,42 @@ st.set_page_config(
 # FUNÇÕES MODULARES
 # =============================================================================
 
-def fetch_data(ticker: str, period: str = "120d") -> pd.DataFrame:
+def fetch_data(ticker: str, period: str = "120d"):
     """
     Coleta dados históricos de preço e volume via yfinance.
-    Retorna DataFrame com OHLCV ou None em caso de erro.
+    Retorna DataFrame com OHLCV e dict de info, ou (None, None) em caso de erro.
     """
     try:
         # Adiciona suffixo .SA para tickers da B3 se necessário
-        if not ticker.endswith(".SA"):
-            ticker_sa = f"{ticker}.SA"
-        else:
-            ticker_sa = ticker
+        ticker_sa = f"{ticker}.SA" if not ticker.endswith(".SA") else ticker
         
         stock = yf.Ticker(ticker_sa)
-        df = stock.history(period=period, interval="1d")
         
-        if df.empty:
-            return None
+        # Tenta buscar histórico com retry simples
+        df = None
+        for attempt in range(3):
+            try:
+                df = stock.history(period=period, interval="1d")
+                if df is not None and not df.empty:
+                    break
+            except:
+                if attempt == 2:
+                    return None, None
+                import time
+                time.sleep(1)
         
-        # Tenta extrair informações fundamentais
-        info = stock.info
+        if df is None or df.empty:
+            return None, None
+        
+        # Extrai info fundamental com try/except para evitar crash
+        try:
+            info = stock.info
+        except:
+            info = {}  # Fallback vazio
         
         return df, info
     except Exception as e:
-        st.error(f"❌ Erro ao buscar {ticker}: {str(e)}")
+        st.warning(f"⚠️ Dados parciais para {ticker}: {str(e)[:100]}")
         return None, None
 
 
@@ -70,44 +92,60 @@ def calc_technicals(df: pd.DataFrame) -> dict:
     close = df['Close']
     volume = df['Volume']
     
-    # RSI(14)
-    rsi = RSIIndicator(close=close, window=14).rsi().iloc[-1]
+    try:
+        # RSI(14)
+        rsi = RSIIndicator(close=close, window=14).rsi().iloc[-1]
+    except:
+        rsi = None
     
-    # MACD (12, 26, 9)
-    macd_ind = MACD(close=close)
-    macd_line = macd_ind.macd().iloc[-1]
-    macd_signal = macd_ind.macd_signal().iloc[-2] if len(macd_ind.macd_signal()) >= 2 else macd_line
-    macd_histogram = macd_ind.macd_diff().iloc[-1]
+    try:
+        # MACD (12, 26, 9)
+        macd_ind = MACD(close=close)
+        macd_line = macd_ind.macd().iloc[-1]
+        macd_signal_vals = macd_ind.macd_signal()
+        macd_signal = macd_signal_vals.iloc[-2] if len(macd_signal_vals) >= 2 else macd_line
+        macd_histogram = macd_ind.macd_diff().iloc[-1]
+    except:
+        macd_line = macd_signal = macd_histogram = None
     
-    # EMAs: 9, 21, 200
-    ema9 = EMAIndicator(close=close, window=9).ema_indicator().iloc[-1]
-    ema21 = EMAIndicator(close=close, window=21).ema_indicator().iloc[-1]
-    ema200 = EMAIndicator(close=close, window=200).ema_indicator().iloc[-1] if len(close) >= 200 else close.iloc[-1]
+    try:
+        # EMAs: 9, 21, 200
+        ema9 = EMAIndicator(close=close, window=9).ema_indicator().iloc[-1]
+        ema21 = EMAIndicator(close=close, window=21).ema_indicator().iloc[-1]
+        ema200 = EMAIndicator(close=close, window=200).ema_indicator().iloc[-1] if len(close) >= 200 else close.iloc[-1]
+    except:
+        ema9 = ema21 = ema200 = None
     
-    # Bandas de Bollinger (20, 2)
-    bb = BollingerBands(close=close, window=20, window_dev=2)
-    bb_lower = bb.bollinger_lband().iloc[-1]
-    bb_upper = bb.bollinger_hband().iloc[-1]
+    try:
+        # Bandas de Bollinger (20, 2)
+        bb = BollingerBands(close=close, window=20, window_dev=2)
+        bb_lower = bb.bollinger_lband().iloc[-1]
+        bb_upper = bb.bollinger_hband().iloc[-1]
+    except:
+        bb_lower = bb_upper = None
     
     # Volume: média móvel de 20 dias
-    vol_ma20 = volume.rolling(20).mean().iloc[-1]
-    current_vol = volume.iloc[-1]
+    try:
+        vol_ma20 = volume.rolling(20).mean().iloc[-1]
+    except:
+        vol_ma20 = None
+    current_vol = volume.iloc[-1] if len(volume) > 0 else None
     
-    current_price = close.iloc[-1]
+    current_price = close.iloc[-1] if len(close) > 0 else None
     
     return {
-        'preco_atual': current_price,
-        'rsi_14': rsi,
-        'macd_line': macd_line,
-        'macd_signal': macd_signal,
-        'macd_histogram': macd_histogram,
-        'ema9': ema9,
-        'ema21': ema21,
-        'ema200': ema200,
-        'bb_lower': bb_lower,
-        'bb_upper': bb_upper,
-        'vol_atual': current_vol,
-        'vol_ma20': vol_ma20
+        'preco_atual': float(current_price) if current_price is not None else None,
+        'rsi_14': float(rsi) if rsi is not None else None,
+        'macd_line': float(macd_line) if macd_line is not None else None,
+        'macd_signal': float(macd_signal) if macd_signal is not None else None,
+        'macd_histogram': float(macd_histogram) if macd_histogram is not None else None,
+        'ema9': float(ema9) if ema9 is not None else None,
+        'ema21': float(ema21) if ema21 is not None else None,
+        'ema200': float(ema200) if ema200 is not None else None,
+        'bb_lower': float(bb_lower) if bb_lower is not None else None,
+        'bb_upper': float(bb_upper) if bb_upper is not None else None,
+        'vol_atual': float(current_vol) if current_vol is not None else None,
+        'vol_ma20': float(vol_ma20) if vol_ma20 is not None else None
     }
 
 
@@ -116,7 +154,7 @@ def check_fundamentals(info: dict) -> dict:
     Avalia indicadores fundamentalistas extraídos do yfinance.
     Retorna dicionário com métricas e status de qualificação.
     """
-    if not info:
+    if not info or not isinstance(info, dict):
         return {'qualificada': False, 'razoes': ['Dados fundamentais indisponíveis']}
     
     # Extrai campos com fallback para None
@@ -124,19 +162,19 @@ def check_fundamentals(info: dict) -> dict:
     pb = info.get('priceToBook')
     roe = info.get('returnOnEquity')
     dy = info.get('dividendYield')
-    debt_ebitda = info.get('debtToEquity')  # Proxy quando EBITDA não disponível
+    debt_equity = info.get('debtToEquity')  # Proxy quando EBITDA não disponível
     net_margin = info.get('profitMargins')
     
     # Converte para valores utilizáveis
-    roe_pct = (roe or 0) * 100 if roe is not None else None
-    dy_pct = (dy or 0) * 100 if dy is not None else None
-    margin_pct = (net_margin or 0) * 100 if net_margin is not None else None
+    roe_pct = (roe or 0) * 100 if isinstance(roe, (int, float)) else None
+    dy_pct = (dy or 0) * 100 if isinstance(dy, (int, float)) else None
+    margin_pct = (net_margin or 0) * 100 if isinstance(net_margin, (int, float)) else None
     
     # Critérios de qualificação fundamental
     criterios = []
     
     # P/L entre 5 e 20
-    if pe and 5 <= pe <= 20:
+    if isinstance(pe, (int, float)) and 5 <= pe <= 20:
         criterios.append(True)
     elif pe is None:
         criterios.append(None)  # Neutro se indisponível
@@ -144,23 +182,23 @@ def check_fundamentals(info: dict) -> dict:
         criterios.append(False)
     
     # ROE > 12%
-    if roe_pct and roe_pct > 12:
+    if isinstance(roe_pct, (int, float)) and roe_pct > 12:
         criterios.append(True)
     elif roe_pct is None:
         criterios.append(None)
     else:
         criterios.append(False)
     
-    # Dívida/EBITDA < 3.0x (usando Debt/Equity como proxy < 100%)
-    if debt_ebitda and debt_ebitda < 100:
+    # Dívida/Equity < 100% (proxy para Dívida/EBITDA < 3.0x)
+    if isinstance(debt_equity, (int, float)) and debt_equity < 100:
         criterios.append(True)
-    elif debt_ebitda is None:
+    elif debt_equity is None:
         criterios.append(None)
     else:
         criterios.append(False)
     
     # DY > 4% (opcional)
-    if dy_pct and dy_pct > 4:
+    if isinstance(dy_pct, (int, float)) and dy_pct > 4:
         criterios.append(True)
     elif dy_pct is None:
         criterios.append(None)
@@ -178,14 +216,14 @@ def check_fundamentals(info: dict) -> dict:
         'pb': pb,
         'roe_pct': roe_pct,
         'dy_pct': dy_pct,
-        'debt_proxy': debt_ebitda,
+        'debt_proxy': debt_equity,
         'margin_pct': margin_pct,
         'qualificada': qualificada,
         'razoes': [
-            f"P/L={pe:.1f}" if pe else "P/L=N/A",
-            f"ROE={roe_pct:.1f}%" if roe_pct else "ROE=N/A",
-            f"Dívida/Proxy={debt_ebitda:.1f}x" if debt_ebitda else "Dívida=N/A",
-            f"DY={dy_pct:.1f}%" if dy_pct else "DY=N/A"
+            f"P/L={pe:.1f}" if isinstance(pe, (int, float)) else "P/L=N/A",
+            f"ROE={roe_pct:.1f}%" if isinstance(roe_pct, (int, float)) else "ROE=N/A",
+            f"Dívida/Proxy={debt_equity:.1f}x" if isinstance(debt_equity, (int, float)) else "Dívida=N/A",
+            f"DY={dy_pct:.1f}%" if isinstance(dy_pct, (int, float)) else "DY=N/A"
         ]
     }
 
@@ -205,40 +243,45 @@ def generate_signal(tech: dict, fund: dict) -> tuple:
     
     # 1. RSI < 35 → sobrevenda (COMPRA)
     rsi = tech.get('rsi_14')
-    if rsi and rsi < 35:
-        score += 1
-        justificativas.append(f"RSI={rsi:.1f} (sobrevenda)")
-    elif rsi and rsi > 65:
-        justificativas.append(f"RSI={rsi:.1f} (sobrecompra ⚠️)")
+    if isinstance(rsi, (int, float)):
+        if rsi < 35:
+            score += 1
+            justificativas.append(f"RSI={rsi:.1f} (sobrevenda)")
+        elif rsi > 65:
+            justificativas.append(f"RSI={rsi:.1f} (sobrecompra ⚠️)")
     
     # 2. MACD: cruzamento de alta + histograma positivo
     macd_l = tech.get('macd_line')
     macd_s = tech.get('macd_signal')
     macd_h = tech.get('macd_histogram')
-    if macd_l and macd_s and macd_l > macd_s and macd_h and macd_h > 0:
-        score += 1
-        justificativas.append("MACD cruzou para cima ✓")
+    if all(isinstance(x, (int, float)) for x in [macd_l, macd_s, macd_h]):
+        if macd_l > macd_s and macd_h > 0:
+            score += 1
+            justificativas.append("MACD cruzou para cima ✓")
     
     # 3. Preço > EMA9 > EMA21 → tendência de alta
     price = tech.get('preco_atual')
     ema9 = tech.get('ema9')
     ema21 = tech.get('ema21')
-    if price and ema9 and ema21 and price > ema9 > ema21:
-        score += 1
-        justificativas.append("Preço acima de EMA9 e EMA21 ✓")
+    if all(isinstance(x, (int, float)) for x in [price, ema9, ema21]):
+        if price > ema9 > ema21:
+            score += 1
+            justificativas.append("Preço acima de EMA9 e EMA21 ✓")
     
     # 4. Bollinger: preço próximo da banda inferior
     bb_lower = tech.get('bb_lower')
-    if price and bb_lower and price <= bb_lower * 1.02:
-        score += 1
-        justificativas.append("Preço na banda inferior de Bollinger ✓")
+    if all(isinstance(x, (int, float)) for x in [price, bb_lower]):
+        if price <= bb_lower * 1.02:
+            score += 1
+            justificativas.append("Preço na banda inferior de Bollinger ✓")
     
     # 5. Volume > 1.2x média de 20 dias
     vol_atual = tech.get('vol_atual')
     vol_ma20 = tech.get('vol_ma20')
-    if vol_atual and vol_ma20 and vol_atual > vol_ma20 * 1.2:
-        score += 1
-        justificativas.append(f"Volume {vol_atual/vol_ma20:.1f}x acima da média ✓")
+    if all(isinstance(x, (int, float)) for x in [vol_atual, vol_ma20]) and vol_ma20 > 0:
+        if vol_atual > vol_ma20 * 1.2:
+            score += 1
+            justificativas.append(f"Volume {vol_atual/vol_ma20:.1f}x acima da média ✓")
     
     # 🔸 ANÁLISE FUNDAMENTAL (Peso 20% - filtro de qualidade)
     fund_razoes = fund.get('razoes', [])
@@ -254,7 +297,7 @@ def generate_signal(tech: dict, fund: dict) -> tuple:
     # 🎯 CLASSIFICAÇÃO FINAL
     if score >= 4 and fund.get('qualificada', False):
         classificacao = "✅ COMPRA CURTO PRAZO"
-    elif score >= 2 and tech.get('rsi_14', 50) <= 65:
+    elif score >= 2 and (rsi is None or rsi <= 65):
         classificacao = "⚠️ AGUARDAR"
     else:
         classificacao = "❌ EVITAR"
@@ -266,7 +309,7 @@ def generate_signal(tech: dict, fund: dict) -> tuple:
     return classificacao, score, justificativa_final
 
 
-def export_to_excel(results: list, raw_data: dict) -> BytesIO:
+def export_to_excel(results: list, raw_ dict) -> BytesIO:
     """
     Gera arquivo Excel com 3 abas: Resumo, Dados Brutos, Glossário.
     Retorna objeto BytesIO para download no Streamlit.
@@ -279,7 +322,7 @@ def export_to_excel(results: list, raw_data: dict) -> BytesIO:
         df_resumo.to_excel(writer, sheet_name='Resumo', index=False)
         
         # Aba 2: Dados Brutos
-        if raw_data:
+        if raw_
             df_brutos = pd.DataFrame(raw_data)
             df_brutos.to_excel(writer, sheet_name='Dados_Brutos', index=False)
         
@@ -382,9 +425,11 @@ def main():
             classificacao, score, justificativa = generate_signal(tech, fund)
             
             # Prepara resultado
+            preco_fmt = f"R$ {tech.get('preco_atual'):.2f}" if isinstance(tech.get('preco_atual'), (int, float)) else "N/A"
+            
             resultado = {
                 'Ticker': ticker,
-                'Preço Atual': f"R$ {tech.get('preco_atual', 0):.2f}",
+                'Preço Atual': preco_fmt,
                 'Sinal Técnico': f"{score}/5",
                 'Score Técnico': score,
                 'Filtro Fundamental': '✓ Qualificada' if fund.get('qualificada') else '⚠️ Atenção',
